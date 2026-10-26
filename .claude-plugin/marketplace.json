@@ -1,0 +1,5 @@
+{
+  "name": "claude-session-widget",
+  "owner": { "name": "KuroTheDesigner" },
+  "plugins": [{ "name": "session-widget", "source": "./" }]
+}

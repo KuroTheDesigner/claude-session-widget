@@ -1,0 +1,5 @@
+{
+  "name": "session-widget",
+  "version": "0.1.0",
+  "description": "An always-on-top desktop widget that shows every session waiting on you and lets you answer it without opening the app."
+}
