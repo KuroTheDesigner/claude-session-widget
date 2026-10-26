@@ -9,7 +9,10 @@ which ones need you and answer them without switching to the app.
   you haven't looked yet.
 - **Hover** it to open the strip of sessions: yellow rings need you, blue ones
   have finished, grey ones are working. A session's child sessions sit in a
-  tray with it.
+  tray with it. The newest change comes first, and idle sessions sink to the
+  bottom.
+- Sessions you hide in the app's sidebar, in a folded project folder or under
+  a folded parent session, are hidden in the widget too.
 - **Hover a session that needs you** to open its card: the question it asked,
   with its answers as buttons, or its latest summary and a box to reply.
 - **Drag** the notch along the right, left or top edge of the screen.

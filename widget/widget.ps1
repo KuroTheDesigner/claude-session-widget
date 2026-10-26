@@ -5,10 +5,14 @@
 # sessions to <Base>\outbox. One copy runs at a time.
 param([string]$Base)
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, UIAutomationClient, UIAutomationTypes
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\ClaudeSessionWidget')
 if (-not $mutex.WaitOne(0)) { exit }
+
+# Drawn on the CPU: a see-through window drawn on the graphics card can go blank
+# for good after the screen locks or the GPU switches, while the widget runs on.
+[Windows.Media.RenderOptions]::ProcessRenderMode = 'SoftwareOnly'
 
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -793,6 +797,37 @@ function Fold { $avatars.Visibility = 'Collapsed'; $avatars.Children.Clear(); Un
 # Hands the avatars' height back to their content once a grow or fold is done with it.
 function Unpin { foreach ($p in $script:P.Height, $script:P.Width) { $avatars.BeginAnimation($p, $null); $avatars.ClearValue($p) } }
 
+# The titles the app's sidebar shows. A session in a folded project folder, or
+# under a folded parent, has no row there: the app keeps folds in memory only.
+# Read from its window every 2 seconds on a thread of its own, since one read
+# takes about a tenth of a second. Titles is $null when there is no sidebar.
+$sidebar = [hashtable]::Synchronized(@{ titles = $null; stop = $false })
+$reader = [PowerShell]::Create().AddScript({
+  param($out)
+  $A = [Windows.Automation.AutomationElement]; $all = [Windows.Automation.TreeScope]::Descendants
+  $named = [Windows.Automation.PropertyCondition]::new($A::NameProperty, 'Sidebar')
+  $buttons = [Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, [Windows.Automation.ControlType]::Button)
+  while (-not $out.stop) {
+    $titles = $null
+    try {
+      $h = (Get-Process claude -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0 | Select-Object -First 1).MainWindowHandle
+      $bar = if ($h) { $A::FromHandle($h).FindAll($all, $named) | Where-Object { $_.Current.ClassName -like '*dframe-sidebar*' } | Select-Object -First 1 }
+      if ($bar) {
+        # Only a sidebar listing code sessions by folder counts; the chat list or no rows at all filters nothing.
+        $rows = @{}; $folders = $false
+        foreach ($e in $bar.FindAll($all, $buttons)) {
+          $name = $e.Current.Name
+          if ($name -match '^More options for (.+)$') { $rows[$Matches[1]] = 1 } elseif ($name -eq 'Group and sort') { $folders = $true }
+        }
+        if ($folders -and $rows.Count) { $titles = $rows }
+      }
+    } catch {}
+    $out.titles = $titles
+    Start-Sleep 2
+  }
+}).AddArgument($sidebar)
+[void]$reader.BeginInvoke()
+
 function Refresh {
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $list = @(); $raw = ''
@@ -810,14 +845,20 @@ function Refresh {
   try {
     $app = [IO.File]::ReadAllText((Join-Path $Base 'app-sessions.json')) | ConvertFrom-Json
     if ($now - [int64]$app.at -lt 60000) {
-      $mine = @{}; foreach ($s in $list) { if ($s.appId) { $mine[$s.appId] = 1 } }
+      $mine = @{}; foreach ($s in $list) { if ($s.appId) { $mine[$s.appId] = $s } }
       foreach ($s in @($app.sessions)) {
-        if (-not $s -or $mine[$s.id] -or @($ui.groups) -notcontains $s.group -or ($s.parent -and -not $ui.children)) { continue }
+        # A session that has not ended a turn since the mod started takes its last change from the app.
+        if ($s -and $mine[$s.id]) { $mine[$s.id] | Add-Member appDoneAt $s.doneAt -Force; continue }
+        if (-not $s -or @($ui.groups) -notcontains $s.group -or ($s.parent -and -not $ui.children)) { continue }
         $s | Add-Member app $true
         $list += $s; $raw += "$($s.id)$($s.state)$($s.doneAt)$($s.title)$($s.parent)$($s.summary)$($s.waiting)$($s.ask)"
       }
     }
   } catch {}
+
+  # What the app's sidebar hides stays hidden here too.
+  $titles = $sidebar.titles
+  if ($titles) { $list = @($list | Where-Object { -not $_.title -or $titles[$_.title] }) }
 
   # Reports on messages sent through the outbox.
   foreach ($sid in @($script:sends.Keys)) {
@@ -850,19 +891,23 @@ function Refresh {
   $shown = @{}; foreach ($s in $list) { $shown[(Key $s)] = 1 }
   $kids = @{}; $roots = @()
   foreach ($s in $list) { if ($s.parent -and $shown[$s.parent]) { $kids[$s.parent] += @($s) } else { $roots += $s } }
-  foreach ($k in @($kids.Keys)) { $kids[$k] = @($kids[$k] | Sort-Object { & $rank $_ }, name, id) }
   $best = { param($s) $r = & $rank $s; foreach ($child in @($kids[(Key $s)])) { if ($child) { $r = [Math]::Min($r, (& $best $child)) } }; $r }
+  # Newest change first, a working session counting as changing now; a family
+  # sits by its newest member, and one where everyone is idle sinks below the rest.
+  $changed = { param($s) $t = if ($s.state -eq 'working') { $now } else { [Math]::Max([int64]$s.doneAt, [int64]$s.appDoneAt) }; foreach ($child in @($kids[(Key $s)])) { if ($child) { $t = [Math]::Max($t, (& $changed $child)) } }; $t }
+  $order = @{ e = { (& $best $_) -eq 3 } }, @{ e = { & $changed $_ }; Descending = $true }, 'name', 'id'
+  foreach ($k in @($kids.Keys)) { $kids[$k] = @($kids[$k] | Sort-Object -Property $order) }
   $ordered = New-Object Collections.ArrayList
   # As in the app's sidebar, a session shows yellow when anything it started needs you.
   $emit = { param($s, $depth)
     $s | Add-Member depth $depth -Force; $s | Add-Member needsAny ((& $best $s) -eq 0) -Force; [void]$ordered.Add($s)
     foreach ($child in @($kids[(Key $s)])) { if ($child) { & $emit $child ($depth + 1) } }
   }
-  foreach ($s in @($roots | Sort-Object { & $best $_ }, { & $rank $_ }, name, id)) { & $emit $s 0 }
+  foreach ($s in @($roots | Sort-Object -Property $order)) { & $emit $s 0 }
   $script:sessions = @($ordered); $script:kids = $kids
   $marks = ($script:sessions | ForEach-Object { "$($_.id)=$(Unseen $_)" }) -join ','
   $sends = ($script:sends.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value.status)" }) -join ','
-  $sig = "$raw|$marks|$sends|$($script:open)|$($ui.mode)|$($script:hover)|$(@($ui.groups) -join ',')|$($ui.children)|$($script:answered.Keys -join ',')|$(($script:picks.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value -join ';')" }) -join ',')"
+  $sig = "$raw|$(@($list | ForEach-Object { Key $_ }) -join ',')|$marks|$sends|$($script:open)|$($ui.mode)|$($script:hover)|$(@($ui.groups) -join ',')|$($ui.children)|$($script:answered.Keys -join ',')|$(($script:picks.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value -join ';')" }) -join ',')"
   if ($sig -ne $script:sig) { $script:sig = $sig; Draw }
 }
 
@@ -1002,4 +1047,5 @@ $hwnd = (New-Object Windows.Interop.WindowInteropHelper $win).Handle
 [FocusWatch]::Start()
 Place (-not [FocusWatch]::AppFocused)
 [Windows.Threading.Dispatcher]::Run()
+$sidebar.stop = $true
 $mutex.ReleaseMutex()
